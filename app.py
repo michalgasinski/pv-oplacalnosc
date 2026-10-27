@@ -130,6 +130,17 @@ with st.sidebar:
         limit_1 = st.number_input("Współwłaściciel 1 [zł]", 0, int(TAX_RELIEF_LIMIT), int(TAX_RELIEF_LIMIT), 1000)
         limit_2 = st.number_input("Współwłaściciel 2 [zł]", 0, int(TAX_RELIEF_LIMIT), int(TAX_RELIEF_LIMIT), 1000)
 
+    st.subheader("Rozliczenie i praca magazynu")
+    pricing_label = st.radio(
+        "Wycena energii oddanej", ["Ceny godzinowe RCE (średnie 2025)", "RCEm (miesięczna)"], index=0,
+        help="Ceny godzinowe: średnia cena 2025 dla każdego miesiąca i godziny. RCEm: jedna cena na miesiąc.",
+    )
+    hourly_pricing = pricing_label.startswith("Ceny godzinowe")
+    evening_export = st.checkbox(
+        "Magazyn sprzedaje nadwyżkę wieczorem", value=True, disabled=not hourly_pricing,
+        help="Wieczorem oddaje do sieci to, czego dom nie potrzebuje do rana. Ma sens tylko przy cenach godzinowych.",
+    )
+
     with st.expander("Zaawansowane: magazyn"):
         efficiency = st.slider("Sprawność magazynu (ładowanie + rozładowanie) [%]", 70, 100, 90) / 100
         dod = st.slider("Użyteczna pojemność magazynu (DoD) [%]", 50, 100, 90) / 100
@@ -153,6 +164,8 @@ inputs = Inputs(
     battery_cost_per_kwh=float(battery_cost),
     battery_round_trip_efficiency=efficiency,
     battery_depth_of_discharge=dod,
+    export_pricing="hourly" if hourly_pricing else "rcem",
+    evening_export=evening_export,
     use_pme2_grant=use_grant,
     use_tax_relief=use_relief,
     tax_rates=(rate_1 / 100, rate_2 / 100),
@@ -174,7 +187,7 @@ grid_price = inputs.grid_price
 # ---------------------------------------------------------------- header and KPIs
 st.title("☀️ Opłacalność fotowoltaiki i magazynu energii")
 st.caption(
-    "Dom z pompą ciepła pod Bydgoszczą, nowa instalacja w net-billingu, taryfa Enea G11 2026. "
+    "Dom z pompą ciepła pod Bydgoszczą, nowa instalacja w net-billingu (RCE × 1,23), taryfa Enea G11 2026. "
     "Średnia z pogody 2019–2023, liczona godzina po godzinie. Szacunek, nie oferta."
 )
 
@@ -216,11 +229,12 @@ with tab_energy:
     st.subheader("Bilans roczny")
     yearly = pd.DataFrame({
         "Pozycja": ["Zużycie domu", "Produkcja PV", "Autokonsumpcja bezpośrednia", "Zużyte z magazynu",
-                    "Straty w magazynie", "Oddana do sieci", "Pobrana z sieci"],
+                    "Straty w magazynie", "Oddana do sieci (razem)", "w tym sprzedana z magazynu wieczorem",
+                    "Pobrana z sieci"],
         "kWh": [m["consumption"].sum(), production, m["direct_use"].sum(), m["from_battery"].sum(),
-                m["battery_losses"].sum(), m["export"].sum(), m["import"].sum()],
+                m["battery_losses"].sum(), m["export"].sum(), m["battery_to_grid"].sum(), m["import"].sum()],
     })
-    yearly["% produkcji"] = (yearly["kWh"] / production).where(yearly.index.isin([2, 3, 4, 5]))
+    yearly["% produkcji"] = (yearly["kWh"] / production).where(yearly.index.isin([2, 3, 4, 5, 6]))
     st.dataframe(
         yearly, hide_index=True, width="stretch",
         column_config={"kWh": st.column_config.NumberColumn(format="%.0f"),
@@ -300,7 +314,7 @@ with tab_money:
         table = pd.DataFrame({
             "Miesiąc": m["month"],
             "RCEm [zł/kWh]": m["rcem"],
-            "Wartość 1 kWh oddanej (×1,23)": m["export_value_per_kwh"],
+            "Średnia wartość 1 kWh oddanej (×1,23)": m["export_value_per_kwh"],
             "Oddana [kWh]": m["export"],
             "Wpływ do depozytu [zł]": m["deposit_in"],
             "Pobrana [kWh]": m["import"],
@@ -316,11 +330,16 @@ with tab_money:
 # ---------------------------------------------------------------- oversizing analysis
 with tab_oversize:
     st.subheader("Jak przewymiarowanie wpływa na czas zwrotu")
+    june_rce = rce_2025()[5] * NET_BILLING_COEFFICIENT
+    price_note = (f"**cenę z danej godziny × 1,23** – w czerwcu w południe średnio {pln(june_rce[12], 2)}, "
+                  f"wieczorem (19–20) {pln(june_rce[19], 2)}" if hourly_pricing else
+                  f"**RCEm × 1,23** – w czerwcu {pln(RCEM_2025[5] * NET_BILLING_COEFFICIENT, 2)}, "
+                  f"w kwietniu {pln(RCEM_2025[3] * NET_BILLING_COEFFICIENT, 2)}")
     st.markdown(
         f"Każda kWh zużyta w domu oszczędza pełną cenę **{pln(grid_price, 2)}**. Każda kWh oddana do sieci "
-        f"jest warta tylko **RCEm × 1,23** – w czerwcu {pln(RCEM_2025[5] * NET_BILLING_COEFFICIENT, 2)}, "
-        f"w kwietniu {pln(RCEM_2025[3] * NET_BILLING_COEFFICIENT, 2)}. Dokładanie paneli zwiększa głównie "
-        "letnią nadwyżkę, więc każdy kolejny kWp zarabia mniej. Magazyn przesuwa część tej nadwyżki na wieczór."
+        f"dostaje tylko {price_note}. Dokładanie paneli zwiększa głównie letnią nadwyżkę w południe, "
+        "więc każdy kolejny kWp zarabia mniej. Magazyn przesuwa część tej nadwyżki na wieczór – dla domu "
+        "albo do sprzedaży po wyższej cenie."
     )
     if inputs.use_pme2_grant:
         st.info("Dotacja PME 2 jest włączona: przysługuje tylko, gdy magazyn ma ≥ 10 kWh i ≥ 2 × moc PV, "
@@ -352,7 +371,7 @@ with tab_oversize:
         st.markdown("**Utracona wartość letniego eksportu (kwiecień–wrzesień) [zł/rok]**")
         st.plotly_chart(battery_lines("summer_export_lost_value", "zł / rok", "%{y:,.0f} zł"), width="stretch")
     st.caption(
-        "Utracona wartość = oddane kWh × (cena zakupu − RCEm × 1,23), czyli ile więcej dałaby ta energia, "
+        "Utracona wartość = oddane kWh × cena zakupu − wpływ do depozytu, czyli ile więcej dałaby ta energia, "
         "gdyby udało się ją zużyć w domu. Linia kropkowana = wybrana moc PV. "
         f"Puste miejsca na wykresie zwrotu oznaczają brak zwrotu w {options.horizon_years} lat."
     )
@@ -517,35 +536,42 @@ od 1.02.2026 – różnica rzędu groszy.
 """)
 
     st.subheader("4. Net-billing")
-    rce_check = result.deposit_hourly_rce or 0
+    at_rcem, at_hourly = result.deposit_at_rcem or 0, result.deposit_at_hourly_rce or 0
+    pricing_text = ("**RCE godzinowe × 1,23** – średnia cena z 2025 r. dla danego miesiąca i godziny"
+                    if hourly_pricing else "**RCEm 2025 × 1,23** – jedna cena na miesiąc")
     st.markdown(f"""
 | Założenie | Wartość |
 |---|---|
-| System | net-billing, nowa instalacja (przyłączenie po 1.07.2024) |
-| Cena energii oddanej | **RCEm 2025 × {num(NET_BILLING_COEFFICIENT, 2)}** (współczynnik korekcyjny) |
+| System | net-billing, nowa instalacja (przyłączenie po 1.07.2024) – rozliczenie po RCE godzinowym |
+| Cena energii oddanej | {pricing_text} |
+| Współczynnik korekcyjny | {num(NET_BILLING_COEFFICIENT, 2)} (dla rozliczenia po RCE) |
+| Ujemne ceny | liczone jako 0 (depozyt nie maleje) |
 | Zwrot niewykorzystanego depozytu | do **{REFUND_CAP_SHARE:.0%}** wartości, po 12 miesiącach |
 | Co pokrywa depozyt | tylko energię czynną ({pln(inputs.energy_price, 4)}/kWh), nie dystrybucję |
 | Bilansowanie | godzinowe – w jednej godzinie pobór i oddanie się znoszą |
 
-**Dlaczego RCEm, a nie ceny godzinowe?** Nowa instalacja formalnie rozlicza się po godzinowej cenie RCE.
-RCEm to jednak średnia z RCE ważona produkcją fotowoltaiki w Polsce, więc już uwzględnia, że panele
-produkują w najtańszych godzinach. Dla czerwca 2025: zwykła średnia RCE ≈ 346 zł/MWh, średnia ważona
-produkcją PV ≈ 128 zł/MWh, RCEm = 136 zł/MWh. RCEm jest też wygodną „prognozą” jedną liczbą na miesiąc.
+**Ceny godzinowe czy RCEm?** Nowa instalacja formalnie rozlicza się po godzinowej cenie RCE. Model używa
+**średnich** RCE z 2025 r. dla każdej pary miesiąc × godzina (288 liczb), a nie cen z konkretnych dni –
+to „typowy profil dnia”, który lepiej nadaje się na prognozę niż przypadkowy przebieg jednego roku.
+RCEm to średnia RCE ważona produkcją fotowoltaiki w Polsce (czerwiec 2025: zwykła średnia ≈ 346 zł/MWh,
+ważona produkcją PV ≈ 128, RCEm = 136), więc dobrze wycenia zwykłe oddawanie z paneli, ale nie widzi,
+**o której** godzinie oddajemy – a to jest kluczowe dla wieczornej sprzedaży z magazynu.
 
-**Sprawdzenie dla obecnej konfiguracji:** te same godzinowe nadwyżki wycenione średnimi godzinowymi cenami
-RCE z 2025 r. (ujemne ceny liczone jako 0) dają depozyt **{pln(rce_check)}** rocznie, a wycenione RCEm –
-**{pln(result.deposit_total)}** (różnica {(rce_check / result.deposit_total - 1) if result.deposit_total else 0:+.0%}).
-Wschodnia połać produkuje więcej rano, gdy prąd jest droższy, a magazyn zabiera poranną nadwyżkę –
-te efekty w dużej mierze się znoszą.
+**Porównanie dla obecnej konfiguracji** (te same godzinowe przepływy energii): depozyt wyceniony cenami
+godzinowymi **{pln(at_hourly)}**, wyceniony RCEm **{pln(at_rcem)}** rocznie
+(różnica {(at_hourly / at_rcem - 1) if at_rcem else 0:+.0%}). Ceny godzinowe dają więcej, bo wschodnia
+połać produkuje rano, gdy prąd jest droższy, a magazyn może sprzedawać wieczorem.
 """)
     rce = rce_2025()
     rcem_table = pd.DataFrame({
         "Miesiąc": MONTH_NAMES,
         "RCEm 2025 [zł/kWh]": RCEM_2025,
-        "Wartość 1 kWh oddanej (×1,23)": RCEM_2025 * NET_BILLING_COEFFICIENT,
-        "RCE w południe (12–13) [zł/kWh]": rce[:, 12],
-        "RCE wieczorem (19–20) [zł/kWh]": rce[:, 19],
+        "RCEm × 1,23": RCEM_2025 * NET_BILLING_COEFFICIENT,
+        "RCE rano (8–9)": rce[:, 8],
+        "RCE w południe (12–13)": rce[:, 12],
+        "RCE wieczorem (19–20)": rce[:, 19],
     })
+    st.caption("Ceny w zł/kWh netto, średnie z 2025 r. (PSE). Do depozytu trafia cena × 1,23.")
     st.dataframe(rcem_table.round(3), hide_index=True, width="stretch")
 
     st.subheader("5. Dotacja i ulga")
@@ -573,12 +599,27 @@ lub wyczerpania budżetu 1 mld zł):
 | Użyteczna pojemność | {dod:.0%} pojemności nominalnej |
 | Moc ładowania/rozładowania | 0,5 × pojemność na godzinę |
 | Ładowanie | tylko z nadwyżki PV (bez ładowania z sieci) |
-| Kolejność | PV → dom → magazyn → sieć; brak: magazyn → sieć |
+| Kolejność | PV → dom → magazyn → sieć; brak energii: magazyn → sieć |
+| Wieczorna sprzedaż | {"włączona" if inputs.evening_export and hourly_pricing else "wyłączona"} – opis poniżej |
 | Okres symulacji | 5 lat × 8760 godzin, wynik = średni rok |
 
+**Strategia wieczornej sprzedaży (wymaga EMS, który pozwala oddawać z magazynu do sieci):**
+1. **Ładowanie w tanich godzinach** – magazyn ładuje się nadwyżką tylko wtedy, gdy typowa cena w tej godzinie
+   jest niska (≤ 1,3 × średnia z 10–15) albo od 14:00. Dzięki temu poranna nadwyżka (droższa) idzie do sieci,
+   a do magazynu trafia najtańsza energia z południa.
+2. **Sprzedaż wieczorem (17–23)** – tylko w godzinach, w których cena po stratach w magazynie jest wyższa
+   niż w południe. Magazyn oddaje do sieci tylko to, co przekracza **rezerwę na noc** = średnie zużycie domu
+   w danym miesiącu od następnej godziny do 7:00.
+3. Reguły opierają się na typowym profilu cen i zużycia, a nie na znajomości przyszłości – realny EMS
+   z prognozą pogody i cen może zrobić to trochę lepiej albo trochę gorzej.
+
+W tej konfiguracji magazyn sprzedaje wieczorem **{kwh(m["battery_to_grid"].sum())}** rocznie, a dla domu
+oddaje **{kwh(m["from_battery"].sum())}**.
+
 **Uproszczenia:** brak opłat stałych (takie same przed i po), dotacja i ulga odjęte od nakładu od razu,
-wzrost cen dotyczy jednakowo zakupu i RCEm, degradacja zmniejsza oszczędność proporcjonalnie, profil
-bytowy to średni profil G11, a nie Twój licznik, model pompy ciepła jest przybliżony.
+wzrost cen dotyczy jednakowo zakupu i cen energii oddanej, degradacja zmniejsza oszczędność proporcjonalnie,
+ceny godzinowe to średnie 2025 (bez zależności między pogodą a ceną w danym dniu), profil bytowy to średni
+profil G11, a nie Twój licznik, model pompy ciepła jest przybliżony.
 """)
 
     st.subheader("7. Źródła")

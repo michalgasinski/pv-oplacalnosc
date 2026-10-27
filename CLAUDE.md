@@ -20,7 +20,7 @@ suwaki i wykresy bez pisania frontendu. Środowisko w `.venv/` (nie commitujemy)
 - `fetch_data.py` – jednorazowe pobranie danych do `data/` (commitujemy CSV, ~2,5 MB)
 - `data/pvgis_bydgoszcz.csv` – PVGIS 5.3, 2019–2023, produkcja na 1 kWp (połać SE i NW) + temperatura
 - `data/enea_g11_profile_2026.csv` – standardowy profil G11 Enea Operator 2026 (udział w rocznym zużyciu)
-- `data/rce_2025_month_hour.csv` – średnie RCE 2025 per miesiąc × godzina (ujemne = 0), do kontroli
+- `data/rce_2025_month_hour.csv` – średnie RCE 2025 per miesiąc × godzina (ujemne = 0) – wycena eksportu
 - `tests/test_pv_model.py` – testy modelu
 
 ## Ustalenia (z użytkownikiem)
@@ -29,8 +29,12 @@ suwaki i wykresy bez pisania frontendu. Środowisko w `.venv/` (nie commitujemy)
 - Zużycie (szacunek, brak danych z licznika): 7000 kWh razem, 2600 bytowe (2 dorosłych, jedno pracuje
   zdalnie), 500 ciepła woda z pompy (opcja), reszta ogrzewanie. Pompa: stopniodni poniżej 15°C ÷ COP,
   COP = 3,6 + 0,12·T (1,5–5).
-- Wycena eksportu: **RCEm 2025 × 1,23** (decyzja użytkownika). RCEm jest ważona produkcją PV, więc
-  oddaje porę produkcji; sprawdzone: depozyt z RCE godzinowego 2025 różni się o ~1%.
+- Wycena eksportu: domyślnie **RCE godzinowe × 1,23** = średnie RCE 2025 dla miesiąc × godzina
+  (ujemne = 0); RCEm 2025 × 1,23 jako opcja. Użytkownik chciał ceny godzinowe, żeby widzieć efekt
+  wieczornej sprzedaży z magazynu (przy RCEm pora oddania nie ma znaczenia).
+- Magazyn (opcja, domyślnie wł., tylko przy cenach godzinowych): ładuje się w tanich godzinach
+  (cena ≤ 1,3 × średnia 10–15 albo od 14:00), wieczorem 17–23 sprzedaje to, co ponad rezerwę na noc
+  (średnie zużycie miesiąca do 7:00), i tylko gdy cena × sprawność > cena w południe.
 - Nowa instalacja → zwrot niewykorzystanego depozytu do 30%. Depozyt pokrywa tylko energię czynną.
 - Ceny: taryfy Enea 2026 zatwierdzone przez Prezesa URE 17.12.2025: energia 0,6187 zł brutto,
   dystrybucja zmienna 0,2890 netto = 0,3555 brutto. Opłaty stałe pomijamy (bez zmian po inwestycji).

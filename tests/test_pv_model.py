@@ -7,6 +7,8 @@ from pv_model import (
     Inputs,
     PaybackOptions,
     analyze,
+    charge_hours,
+    evening_export_hours,
     heat_pump_cop,
     load_components,
     monthly_average,
@@ -59,21 +61,27 @@ def test_cop_is_lower_in_frost():
 @pytest.mark.parametrize("battery", [0, 5, 20])
 def test_energy_balance_holds(battery):
     m = analyze(Inputs(battery_kwh=battery)).monthly
-    assert np.allclose(m["production"], m["direct_use"] + m["battery_charge"] + m["export"])
+    # PV goes to the house, into the battery or to the grid; "export" also holds battery sales.
+    assert np.allclose(m["production"], m["direct_use"] + m["battery_charge"] + m["export"] - m["battery_to_grid"])
     assert np.allclose(m["consumption"], m["direct_use"] + m["from_battery"] + m["import"])
     assert (m["battery_losses"] >= -1e-9).all()
 
 
 def test_battery_increases_self_consumption_and_reduces_export():
-    without = analyze(Inputs(battery_kwh=0)).monthly
-    with_battery = analyze(Inputs(battery_kwh=10)).monthly
+    without = analyze(Inputs(battery_kwh=0, evening_export=False)).monthly
+    with_battery = analyze(Inputs(battery_kwh=10, evening_export=False)).monthly
     assert with_battery["self_consumption"].sum() > without["self_consumption"].sum()
     assert with_battery["export"].sum() < without["export"].sum()
 
 
-def test_deposit_value_uses_rcem_and_coefficient(default_result):
-    june = default_result.monthly.iloc[5]
+def test_deposit_value_uses_rcem_and_coefficient():
+    june = analyze(Inputs(export_pricing="rcem")).monthly.iloc[5]
     assert june["deposit_in"] == pytest.approx(june["export"] * 0.13630 * 1.23)
+
+
+def test_hourly_deposit_is_between_cheapest_and_dearest_hour(default_result):
+    june = default_result.monthly.iloc[5]
+    assert 0 < june["export_value_per_kwh"] < 1.23 * 1.2
 
 
 def test_savings_decomposition(default_result):
@@ -91,9 +99,29 @@ def test_deposit_only_covers_energy_part_and_refund_is_capped_at_30_percent():
     assert res.deposit_refund <= 0.3 * res.deposit_total + 1e-9
 
 
-def test_hourly_rce_check_is_close_to_rcem(default_result):
+def test_hourly_rce_check_is_close_to_rcem():
     # RCEm is PV-weighted, so valuing the same exports at hourly prices gives a similar deposit.
-    assert default_result.deposit_hourly_rce == pytest.approx(default_result.deposit_total, rel=0.15)
+    res = analyze(Inputs(export_pricing="rcem"))
+    assert res.deposit_at_hourly_rce == pytest.approx(res.deposit_at_rcem, rel=0.15)
+    assert res.deposit_total == pytest.approx(res.deposit_at_rcem)
+
+
+def test_evening_export_only_with_hourly_prices():
+    assert not evening_export_hours(Inputs(export_pricing="rcem")).any()
+    assert not evening_export_hours(Inputs(evening_export=False)).any()
+    assert evening_export_hours(Inputs()).any()
+    assert charge_hours(Inputs(evening_export=False)).all()
+    assert analyze(Inputs(export_pricing="rcem")).monthly["battery_to_grid"].sum() == 0
+
+
+def test_evening_export_pays_more_and_keeps_night_reserve():
+    off = analyze(Inputs(evening_export=False))
+    on = analyze(Inputs())
+    assert on.annual_savings > off.annual_savings
+    sold = on.monthly["battery_to_grid"]
+    assert sold.iloc[5] > 0 and sold.iloc[0] == pytest.approx(0, abs=1)  # June yes, January no surplus
+    # The night reserve keeps most of the battery's help for the house.
+    assert on.monthly["from_battery"].sum() > 0.8 * off.monthly["from_battery"].sum()
 
 
 def test_pme2_grant_conditions_and_caps():
