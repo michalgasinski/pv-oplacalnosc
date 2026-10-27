@@ -1,265 +1,388 @@
 """Profitability model for a PV installation with an optional battery.
 
-Single-family house in Poland, heated with a heat pump, settled under net-billing.
+Single-family house near Bydgoszcz, heated with a heat pump, new net-billing prosumer, Enea G11.
 This module contains only calculations (no UI), so it can be tested on its own.
 
 Method in short:
-1. Monthly PV production and monthly consumption are split into a typical day per month
-   (24 hourly values). Each month has two day types, sunny and cloudy, so the battery
-   is not credited with a perfectly even surplus every day.
-2. For every hour: PV covers the load first, the surplus charges the battery, the rest is
+1. Real hourly weather for 2019-2023 (PVGIS): PV output for both roof slopes and air temperature.
+2. Consumption per hour = household use (Enea standard G11 profile) + heat pump space heating
+   (driven by temperature) + hot water.
+3. For every hour: PV covers the load first, the surplus charges the battery, the rest is
    exported. A deficit is covered by the battery first, the rest is imported.
-3. Exported energy goes to the prosumer deposit at RCEm * 1.23. The deposit pays only the
+4. Exported energy goes to the prosumer deposit at RCEm * 1.23. The deposit pays only the
    energy part of the bill; distribution is always paid for every imported kWh.
+5. Results are averaged over the five weather years.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+DATA = Path(__file__).parent / "data"
 
 MONTH_NAMES = [
     "Styczeń", "Luty", "Marzec", "Kwiecień", "Maj", "Czerwiec",
     "Lipiec", "Sierpień", "Wrzesień", "Październik", "Listopad", "Grudzień",
 ]
-DAYS_IN_MONTH = np.array([31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31])
 
-# Official monthly RCEm prices for 2025 [PLN/kWh net], index 0 = January.
+# Official monthly RCEm prices for 2025 [PLN/kWh net], index 0 = January. RCEm is the average
+# market price weighted by national PV output, so it already reflects when PV produces.
 RCEM_2025 = np.array([
     0.48001, 0.44202, 0.17884, 0.16319, 0.21697, 0.13630,
     0.28483, 0.21468, 0.27971, 0.33027, 0.38288, 0.46608,
 ])
-# Statutory correction coefficient applied to the value of exported energy.
+# Statutory correction coefficient applied to the deposit of prosumers settled on RCE.
 NET_BILLING_COEFFICIENT = 1.23
-# Deposit left unused after 12 months is refunded only up to 20% of the exported value.
-REFUND_CAP_SHARE = 0.20
+# Deposit left unused after 12 months is refunded up to 30% of the month's value (RCE settlement).
+REFUND_CAP_SHARE = 0.30
 
-# Share of annual PV yield per month for a south-facing system in Poland (sums to 1).
-_PV_MONTHLY_RAW = np.array([25, 40, 75, 115, 135, 140, 140, 125, 85, 60, 30, 20], dtype=float)
-PV_MONTHLY_SHARE = _PV_MONTHLY_RAW / _PV_MONTHLY_RAW.sum()
+# Enea G11 tariffs for 2026 approved by the URE President on 17.12.2025, gross [PLN/kWh].
+ENEA_ENERGY_PRICE_2026 = 0.6187  # Enea S.A., 0.4980 net + excise + VAT
+# Enea Operator variable distribution: network 0.2456 + quality 0.0331 + RES 0.0073 + CHP 0.0030 net.
+ENEA_DISTRIBUTION_NET_2026 = 0.2456 + 0.0331 + 0.0073 + 0.0030
+ENEA_DISTRIBUTION_PRICE_2026 = round(ENEA_DISTRIBUTION_NET_2026 * 1.23, 4)
 
-# Approximate day length [h] around 52°N and solar noon in local clock time
-# (CET in Nov-Mar, CEST in Apr-Oct shifts noon by one hour).
-DAYLIGHT_HOURS = np.array([8.2, 9.9, 11.9, 13.9, 15.6, 16.6, 16.2, 14.6, 12.6, 10.6, 8.7, 7.8])
-SOLAR_NOON = np.array([11.75] * 3 + [12.75] * 7 + [11.75] * 2)
-
-# Two day types per month, equally frequent: a sunny day gives 1.5x the average
-# production and a cloudy day 0.5x. Their mean equals the monthly average.
-DAY_TYPE_FACTORS = np.array([1.5, 0.5])
-
-# Household (non-heating) use: slightly higher in winter (lighting, more time indoors).
-HOUSEHOLD_SEASONAL_WEIGHTS = np.array(
-    [1.15, 1.10, 1.00, 0.95, 0.90, 0.85, 0.85, 0.85, 0.90, 1.00, 1.10, 1.15]
-)
-# Heat pump use for space heating, roughly following heating degree days (zero in summer).
-HEAT_PUMP_MONTHLY_WEIGHTS = np.array([22, 19, 14, 6, 1.5, 0, 0, 0, 1.5, 7, 13, 20], dtype=float)
-
-# Hourly shape of household use: low at night, morning peak, high in the evening.
-HOUSEHOLD_HOURLY_WEIGHTS = np.array([
-    0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.9, 1.3, 1.0, 0.7, 0.7, 0.7,
-    0.7, 0.7, 0.7, 0.7, 0.9, 1.3, 1.6, 1.7, 1.6, 1.3, 0.9, 0.6,
-])
-# Hourly shape of heat pump use: works all day, more at night and in the cold morning.
-HEAT_PUMP_HOURLY_WEIGHTS = np.array([
-    1.15, 1.15, 1.15, 1.15, 1.15, 1.15, 1.3, 1.3, 1.3, 0.8, 0.8, 0.8,
-    0.8, 0.8, 0.8, 0.8, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.1, 1.1,
+# Heat pump model (air-to-water, underfloor heating ~35°C):
+HEATING_BASE_TEMP_C = 15.0  # no space heating when the daily mean is above this
+COP_AT_0C, COP_SLOPE, COP_MIN, COP_MAX = 3.6, 0.12, 1.5, 5.0
+# Hot water: tank reheated mainly in the morning and evening.
+HOT_WATER_HOURLY_WEIGHTS = np.array([
+    0.5, 0.5, 0.5, 0.5, 0.5, 1.0, 2.0, 2.0, 1.5, 0.8, 0.6, 0.6,
+    0.8, 0.6, 0.6, 0.6, 0.8, 1.2, 1.8, 2.0, 2.0, 1.5, 0.8, 0.5,
 ])
 
-# Number of identical days simulated in a row; only the last one is recorded, so the
-# battery starts it with the charge it would really carry over from the previous evening.
-_WARMUP_DAYS = 3
+# PME 2 grant (NFOŚiGW, call from 20.10.2026) for net-billing prosumers.
+PME2_SHARE, PME2_PER_KWH, PME2_CAP, PME2_MIN_KWH, PME2_PV_RATIO = 0.30, 800.0, 16000.0, 10.0, 2.0
+# Thermal modernisation tax relief: deduction limit per taxpayer.
+TAX_RELIEF_LIMIT = 53000.0
+
+FLOW_NAMES = ("direct_use", "battery_charge", "from_battery", "export", "import")
 
 
 @dataclass(frozen=True)
 class Inputs:
     pv_kwp: float = 8.0
+    nw_share: float = 0.0  # part of PV power on the north-west slope (rest on south-east)
     battery_kwh: float = 10.0
     annual_consumption_kwh: float = 7000.0
-    household_kwh: float = 2800.0  # part of annual consumption that is not heating
-    pv_yield_kwh_per_kwp: float = 1000.0
-    grid_price: float = 1.15  # PLN/kWh gross, energy + distribution
-    energy_price_part: float = 0.62  # PLN/kWh gross, the part the deposit can pay for
+    household_kwh: float = 2600.0
+    hot_water_kwh: float = 500.0  # 0 when the heat pump does not heat water
+    energy_price: float = ENEA_ENERGY_PRICE_2026  # gross, the part the deposit can pay for
+    distribution_price: float = ENEA_DISTRIBUTION_PRICE_2026  # gross, always paid per imported kWh
     pv_cost_per_kwp: float = 3500.0
     battery_cost_per_kwh: float = 2000.0
     battery_round_trip_efficiency: float = 0.90
     battery_depth_of_discharge: float = 0.90
     battery_c_rate: float = 0.5  # max charge/discharge power as a fraction of capacity per hour
+    use_pme2_grant: bool = False
+    use_tax_relief: bool = True
+    tax_rates: tuple[float, float] = (0.32, 0.12)  # two co-owners
+    relief_limits: tuple[float, float] = (TAX_RELIEF_LIMIT, TAX_RELIEF_LIMIT)  # limit still unused
 
     @property
-    def distribution_price_part(self) -> float:
-        return self.grid_price - self.energy_price_part
+    def grid_price(self) -> float:
+        return self.energy_price + self.distribution_price
 
     @property
-    def investment(self) -> float:
-        return self.pv_kwp * self.pv_cost_per_kwp + self.battery_kwh * self.battery_cost_per_kwh
+    def heating_kwh(self) -> float:
+        return max(self.annual_consumption_kwh - self.household_kwh - self.hot_water_kwh, 0.0)
+
+    @property
+    def pv_investment(self) -> float:
+        return self.pv_kwp * self.pv_cost_per_kwp
 
     @property
     def battery_investment(self) -> float:
         return self.battery_kwh * self.battery_cost_per_kwh
 
-
-def monthly_consumption(inp: Inputs) -> np.ndarray:
-    """Monthly consumption [kWh]: household part spread evenly-ish, heat pump part by heating need."""
-    household = inp.household_kwh * HOUSEHOLD_SEASONAL_WEIGHTS / HOUSEHOLD_SEASONAL_WEIGHTS.sum()
-    heat_pump_kwh = max(inp.annual_consumption_kwh - inp.household_kwh, 0.0)
-    heat_pump = heat_pump_kwh * HEAT_PUMP_MONTHLY_WEIGHTS / HEAT_PUMP_MONTHLY_WEIGHTS.sum()
-    return household + heat_pump
+    @property
+    def investment(self) -> float:
+        return self.pv_investment + self.battery_investment
 
 
-def monthly_production(inp: Inputs) -> np.ndarray:
-    """Monthly PV production [kWh]."""
-    return inp.pv_kwp * inp.pv_yield_kwh_per_kwp * PV_MONTHLY_SHARE
+# ---------------------------------------------------------------- source data
+
+@lru_cache(maxsize=1)
+def weather() -> pd.DataFrame:
+    """Hourly PV output per 1 kWp for both slopes and air temperature (PVGIS, local time)."""
+    return pd.read_csv(DATA / "pvgis_bydgoszcz.csv")
 
 
-def pv_daily_shape() -> np.ndarray:
-    """(12, 24) array: share of a day's PV production in each hour (rows sum to 1).
+@lru_cache(maxsize=1)
+def household_shape() -> np.ndarray:
+    """Enea G11 standard profile mapped onto the weather hours, normalised to 1 per year."""
+    w = weather()
+    profile = pd.read_csv(DATA / "enea_g11_profile_2026.csv").set_index(["day_of_year", "hour"])["share"]
+    keys = pd.MultiIndex.from_arrays([w["day_of_year"].clip(upper=365), w["hour"]])
+    shape = profile.reindex(keys).to_numpy()
+    return shape / pd.Series(shape).groupby(w["year"].to_numpy()).transform("sum").to_numpy()
 
-    Production follows a sine arc between sunrise and sunset, evaluated at the middle of each hour.
+
+@lru_cache(maxsize=1)
+def rce_2025() -> np.ndarray:
+    """(12, 24) average hourly RCE in 2025 [PLN/kWh], negative prices counted as zero."""
+    rce = pd.read_csv(DATA / "rce_2025_month_hour.csv")
+    return rce.pivot(index="month", columns="hour", values="price").to_numpy() / 1000
+
+
+def heat_pump_cop(temp_c: np.ndarray) -> np.ndarray:
+    """Approximate COP of an air-to-water heat pump: worse in frost, better in mild weather."""
+    return np.clip(COP_AT_0C + COP_SLOPE * temp_c, COP_MIN, COP_MAX)
+
+
+def heating_shape() -> np.ndarray:
+    """Share of yearly heating electricity in each hour, averaged so a mean year sums to 1.
+
+    Heat need follows how far the daily mean temperature is below 15°C (heating degree days,
+    the building's thermal mass smooths hourly swings); electricity = heat / COP at the hour's
+    temperature. Colder years therefore use more than the average, milder years less.
     """
-    hour_mid = np.arange(24) + 0.5
-    sunrise = SOLAR_NOON - DAYLIGHT_HOURS / 2
-    phase = (hour_mid[None, :] - sunrise[:, None]) / DAYLIGHT_HOURS[:, None]
-    shape = np.where((phase > 0) & (phase < 1), np.sin(np.pi * np.clip(phase, 0, 1)), 0.0)
-    return shape / shape.sum(axis=1, keepdims=True)
+    w = weather()
+    daily_mean = w.groupby(["year", "day_of_year"])["temp_c"].transform("mean").to_numpy()
+    heat = np.maximum(HEATING_BASE_TEMP_C - daily_mean, 0.0)
+    electricity = heat / heat_pump_cop(w["temp_c"].to_numpy())
+    n_years = w["year"].nunique()
+    return electricity / electricity.sum() * n_years
 
 
-def load_daily_profile(inp: Inputs) -> np.ndarray:
-    """(12, 24) array: average hourly consumption [kWh] on a typical day of each month."""
-    household = inp.household_kwh * HOUSEHOLD_SEASONAL_WEIGHTS / HOUSEHOLD_SEASONAL_WEIGHTS.sum()
-    heat_pump = monthly_consumption(inp) - household
-    household_shape = HOUSEHOLD_HOURLY_WEIGHTS / HOUSEHOLD_HOURLY_WEIGHTS.sum()
-    heat_pump_shape = HEAT_PUMP_HOURLY_WEIGHTS / HEAT_PUMP_HOURLY_WEIGHTS.sum()
-    per_day_household = (household / DAYS_IN_MONTH)[:, None] * household_shape[None, :]
-    per_day_heat_pump = (heat_pump / DAYS_IN_MONTH)[:, None] * heat_pump_shape[None, :]
-    return per_day_household + per_day_heat_pump
+def hot_water_shape() -> np.ndarray:
+    w = weather()
+    weights = HOT_WATER_HOURLY_WEIGHTS[w["hour"].to_numpy()]
+    return weights / pd.Series(weights).groupby(w["year"].to_numpy()).transform("sum").to_numpy()
 
 
-def simulate_energy(inp: Inputs) -> pd.DataFrame:
-    """Hour-by-hour energy balance on typical days, summed up to months.
+def load_components(inp: Inputs) -> dict[str, np.ndarray]:
+    """Hourly consumption [kWh] split into household, space heating and hot water."""
+    return {
+        "household": inp.household_kwh * household_shape(),
+        "heating": inp.heating_kwh * heating_shape(),
+        "hot_water": inp.hot_water_kwh * hot_water_shape(),
+    }
 
-    Returns a DataFrame with one row per month and columns in kWh.
+
+def pv_per_kwp(nw_share: float) -> np.ndarray:
+    w = weather()
+    return (1 - nw_share) * w["pv_se"].to_numpy() + nw_share * w["pv_nw"].to_numpy()
+
+
+# ---------------------------------------------------------------- energy simulation
+
+def simulate_hourly(pv_unit: np.ndarray, load: np.ndarray, pv_kwp: np.ndarray, battery_kwh: np.ndarray,
+                    inp: Inputs) -> dict[str, np.ndarray]:
+    """Hour-by-hour energy flows for many PV/battery configurations at once.
+
+    pv_unit and load have one value per hour; pv_kwp and battery_kwh one value per configuration.
+    Returns arrays of shape (hours, configurations) in kWh.
     """
-    # Shapes below: (month, day type, hour).
-    pv_per_day = monthly_production(inp) / DAYS_IN_MONTH
-    pv = pv_per_day[:, None, None] * DAY_TYPE_FACTORS[None, :, None] * pv_daily_shape()[:, None, :]
-    load = np.broadcast_to(load_daily_profile(inp)[:, None, :], pv.shape)
+    pv = pv_unit[:, None] * pv_kwp[None, :]
+    load2d = np.broadcast_to(load[:, None], pv.shape)
+    direct = np.minimum(pv, load2d)
+    surplus = pv - direct
+    deficit = load2d - direct
 
-    usable_capacity = inp.battery_kwh * inp.battery_depth_of_discharge
-    max_power = inp.battery_kwh * inp.battery_c_rate
+    usable = battery_kwh * inp.battery_depth_of_discharge
+    max_power = battery_kwh * inp.battery_c_rate
     # Round-trip losses split equally between charging and discharging.
-    one_way_efficiency = np.sqrt(inp.battery_round_trip_efficiency)
-
-    soc = np.zeros(pv.shape[:2])  # energy stored in the battery [kWh]
-    flows = {name: np.zeros(pv.shape) for name in ("direct", "charge", "discharge", "export", "import")}
-
-    for day in range(_WARMUP_DAYS):
-        for hour in range(24):
-            p, l = pv[:, :, hour], load[:, :, hour]
-            direct = np.minimum(p, l)
-            surplus = p - direct
-            deficit = l - direct
-
-            # Surplus charges the battery (limited by free space and power), the rest is exported.
-            charge = np.minimum.reduce([surplus, (usable_capacity - soc) / one_way_efficiency,
-                                        np.full_like(soc, max_power)])
-            soc = soc + charge * one_way_efficiency
-            export = surplus - charge
-
-            # Deficit is covered from the battery first, the rest is imported from the grid.
-            discharge = np.minimum.reduce([deficit, soc * one_way_efficiency, np.full_like(soc, max_power)])
-            soc = soc - discharge / one_way_efficiency
-            grid_import = deficit - discharge
-
-            if day == _WARMUP_DAYS - 1:
-                for name, value in (("direct", direct), ("charge", charge), ("discharge", discharge),
-                                    ("export", export), ("import", grid_import)):
-                    flows[name][:, :, hour] = value
-
-    def monthly(name: str) -> np.ndarray:
-        # Sum the day, average over day types (equally frequent), scale to the month.
-        return flows[name].sum(axis=2).mean(axis=1) * DAYS_IN_MONTH
-
-    direct, discharge = monthly("direct"), monthly("discharge")
-    charge = monthly("charge")
-    return pd.DataFrame({
-        "month": MONTH_NAMES,
-        "consumption": monthly_consumption(inp),
-        "production": monthly_production(inp),
+    eff = np.sqrt(inp.battery_round_trip_efficiency)
+    charge = np.zeros_like(pv)
+    discharge = np.zeros_like(pv)
+    if np.any(battery_kwh > 0):
+        soc = np.zeros_like(battery_kwh, dtype=float)
+        for h in range(len(pv_unit)):
+            # Surplus charges the battery (limited by free space and power).
+            c = np.minimum(np.minimum(surplus[h], (usable - soc) / eff), max_power)
+            soc += c * eff
+            # Deficit is covered from the battery (limited by stored energy and power).
+            d = np.minimum(np.minimum(deficit[h], soc * eff), max_power)
+            soc -= d / eff
+            charge[h], discharge[h] = c, d
+    return {
+        "production": pv,
+        "consumption": load2d,
         "direct_use": direct,
-        "from_battery": discharge,
-        "self_consumption": direct + discharge,
         "battery_charge": charge,
-        "battery_losses": charge - discharge,
-        "export": monthly("export"),
-        "import": monthly("import"),
-    })
+        "from_battery": discharge,
+        "export": surplus - charge,
+        "import": deficit - discharge,
+    }
+
+
+@lru_cache(maxsize=1)
+def _month_blocks() -> tuple[np.ndarray, np.ndarray, int]:
+    """Start index of every (year, month) block of consecutive hours, its month and number of years."""
+    w = weather()
+    key = (w["year"] * 12 + w["month"] - 1).to_numpy()
+    starts = np.r_[0, np.nonzero(np.diff(key))[0] + 1]
+    return starts, w["month"].to_numpy()[starts] - 1, w["year"].nunique()
+
+
+def monthly_average(hourly: np.ndarray) -> np.ndarray:
+    """Sum hours into (year, month), then average over weather years -> shape (12, configurations)."""
+    starts, months, n_years = _month_blocks()
+    sums = np.add.reduceat(hourly, starts, axis=0)
+    out = np.zeros((12,) + hourly.shape[1:])
+    np.add.at(out, months, sums)
+    return out / n_years
+
+
+# ---------------------------------------------------------------- money
+
+@dataclass(frozen=True)
+class Support:
+    grant: float
+    grant_note: str | None  # why the grant is not available, if it is not
+    tax_relief: float
+
+
+def pme2_grant(inp: Inputs) -> tuple[float, str | None]:
+    """PME 2: 30% of battery costs, max 800 PLN per kWh and 16 000 PLN for net-billing.
+
+    Conditions: battery at least 10 kWh and at least twice the PV peak power.
+    """
+    if not inp.use_pme2_grant or inp.battery_kwh == 0:
+        return 0.0, None
+    if inp.battery_kwh < PME2_MIN_KWH:
+        return 0.0, f"magazyn musi mieć co najmniej {PME2_MIN_KWH:g} kWh"
+    if inp.battery_kwh < PME2_PV_RATIO * inp.pv_kwp:
+        return 0.0, f"magazyn musi mieć co najmniej 2 × moc PV = {PME2_PV_RATIO * inp.pv_kwp:g} kWh"
+    amount = min(PME2_SHARE * inp.battery_investment, PME2_PER_KWH * inp.battery_kwh, PME2_CAP)
+    return amount, None
+
+
+def tax_relief(inp: Inputs, grant: float) -> float:
+    """Thermal modernisation relief: costs not covered by grants are deducted from taxable income.
+
+    Each co-owner deducts up to their remaining limit; the cost goes first to the person with the
+    higher tax rate. Benefit = deducted amount * that person's tax rate.
+    """
+    if not inp.use_tax_relief:
+        return 0.0
+    remaining = inp.investment - grant
+    benefit = 0.0
+    for rate, limit in sorted(zip(inp.tax_rates, inp.relief_limits), reverse=True):
+        deducted = min(remaining, limit)
+        benefit += deducted * rate
+        remaining -= deducted
+    return benefit
+
+
+def support(inp: Inputs) -> Support:
+    grant, note = pme2_grant(inp)
+    return Support(grant=grant, grant_note=note, tax_relief=tax_relief(inp, grant))
 
 
 @dataclass(frozen=True)
 class Result:
     inputs: Inputs
-    monthly: pd.DataFrame  # energy [kWh] and money [PLN] per month
+    monthly: pd.DataFrame  # energy [kWh] and money [PLN] per month, average weather year
     bill_before: float
     bill_after: float
-    deposit_total: float  # value of exported energy credited to the deposit
-    deposit_used: float  # part of the deposit that paid the energy part of bills
-    deposit_refund: float  # part of the unused deposit paid back (max 20%)
-    deposit_forfeited: float  # unused deposit that is lost
+    deposit_total: float
+    deposit_used: float
+    deposit_refund: float
+    deposit_forfeited: float
     savings_from_self_consumption: float
     annual_savings: float
+    support: Support
+    deposit_hourly_rce: float | None = None  # check: deposit if valued at 2025 hourly RCE
+
+    @property
+    def net_investment(self) -> float:
+        return self.inputs.investment - self.support.grant - self.support.tax_relief
 
     @property
     def simple_payback_years(self) -> float | None:
         if self.annual_savings <= 0:
             return None
-        return self.inputs.investment / self.annual_savings
+        return self.net_investment / self.annual_savings
 
 
-def analyze(inp: Inputs) -> Result:
-    """Energy balance plus the annual bill under net-billing.
+def net_billing(export: np.ndarray, grid_import: np.ndarray, consumption: np.ndarray, inp: Inputs) -> dict:
+    """Annual bill under net-billing for an average weather year, for one or many configurations.
 
-    The year is treated as a steady state of a running installation: deposit from any month can
-    pay bills of the following 12 months, so over a whole year the deposit can cover at most the
-    whole annual energy part of the bill. Whatever is left is refunded up to 20% of its value.
+    Inputs are monthly kWh with shape (12,) or (12, configurations).
+    The deposit from any month can pay energy bills of the following 12 months, so over a whole
+    year it can cover at most the annual energy part of the bill. What is left is refunded up to
+    30% of the deposited value; the rest is lost.
     """
-    df = simulate_energy(inp)
-
+    value_per_kwh = RCEM_2025 * NET_BILLING_COEFFICIENT
+    if export.ndim == 2:
+        value_per_kwh = value_per_kwh[:, None]
     # Value of exported energy credited to the deposit: kWh * RCEm * 1.23.
+    deposit_total = (export * value_per_kwh).sum(axis=0)
+    energy_cost = grid_import.sum(axis=0) * inp.energy_price
+    distribution_cost = grid_import.sum(axis=0) * inp.distribution_price
+    deposit_used = np.minimum(deposit_total, energy_cost)
+    unused = deposit_total - deposit_used
+    refund = np.minimum(unused, REFUND_CAP_SHARE * deposit_total)
+    bill_before = consumption.sum() * inp.grid_price
+    bill_after = distribution_cost + energy_cost - deposit_used - refund
+    return {
+        "deposit_total": deposit_total,
+        "deposit_used": deposit_used,
+        "deposit_refund": refund,
+        "deposit_forfeited": unused - refund,
+        "bill_before": bill_before,
+        "bill_after": bill_after,
+        "annual_savings": bill_before - bill_after,
+    }
+
+
+def finance(inp: Inputs, monthly: pd.DataFrame) -> Result:
+    """Monthly money table plus the annual net-billing result for one configuration."""
+    df = monthly.copy()
     df["rcem"] = RCEM_2025
     df["export_value_per_kwh"] = RCEM_2025 * NET_BILLING_COEFFICIENT
     df["deposit_in"] = df["export"] * df["export_value_per_kwh"]
-    # Imported energy split into the part the deposit can pay (energy) and the part it cannot.
-    df["energy_cost"] = df["import"] * inp.energy_price_part
-    df["distribution_cost"] = df["import"] * inp.distribution_price_part
+    df["energy_cost"] = df["import"] * inp.energy_price
+    df["distribution_cost"] = df["import"] * inp.distribution_price
     df["bill_before"] = df["consumption"] * inp.grid_price
     # Opportunity loss: an exported kWh is worth RCEm * 1.23, a self-consumed one saves the full price.
     df["export_lost_value"] = df["export"] * (inp.grid_price - df["export_value_per_kwh"])
 
-    deposit_total = df["deposit_in"].sum()
-    energy_cost_total = df["energy_cost"].sum()
-    deposit_used = min(deposit_total, energy_cost_total)
-    unused = deposit_total - deposit_used
-    refund = min(unused, REFUND_CAP_SHARE * deposit_total)
-
-    bill_before = df["bill_before"].sum()
-    bill_after = df["distribution_cost"].sum() + energy_cost_total - deposit_used - refund
-    savings_self = df["self_consumption"].sum() * inp.grid_price
-
+    year = net_billing(df["export"].to_numpy(), df["import"].to_numpy(), df["consumption"].to_numpy(), inp)
     return Result(
         inputs=inp,
         monthly=df,
-        bill_before=bill_before,
-        bill_after=bill_after,
-        deposit_total=deposit_total,
-        deposit_used=deposit_used,
-        deposit_refund=refund,
-        deposit_forfeited=unused - refund,
-        savings_from_self_consumption=savings_self,
-        annual_savings=bill_before - bill_after,
+        savings_from_self_consumption=df["self_consumption"].sum() * inp.grid_price,
+        support=support(inp),
+        **{k: float(v) for k, v in year.items()},
     )
 
+
+def _monthly_frame(flows: dict[str, np.ndarray], components: dict[str, np.ndarray], column: int) -> pd.DataFrame:
+    data = {"month": MONTH_NAMES}
+    for name, values in flows.items():
+        data[name] = monthly_average(values[:, [column]])[:, 0]
+    for name, values in components.items():
+        data[f"load_{name}"] = monthly_average(values[:, None])[:, 0]
+    frame = pd.DataFrame(data)
+    frame["self_consumption"] = frame["direct_use"] + frame["from_battery"]
+    frame["battery_losses"] = frame["battery_charge"] - frame["from_battery"]
+    return frame
+
+
+def analyze(inp: Inputs) -> Result:
+    components = load_components(inp)
+    load = sum(components.values())
+    flows = simulate_hourly(pv_per_kwp(inp.nw_share), load, np.array([inp.pv_kwp]),
+                            np.array([inp.battery_kwh]), inp)
+    result = finance(inp, _monthly_frame(flows, components, 0))
+
+    # Check of the RCEm simplification: value the same hourly exports at 2025 hourly RCE.
+    w = weather()
+    hourly_price = rce_2025()[w["month"].to_numpy() - 1, w["hour"].to_numpy()]
+    n_years = w["year"].nunique()
+    check = (flows["export"][:, 0] * hourly_price).sum() / n_years * NET_BILLING_COEFFICIENT
+    return replace(result, deposit_hourly_rce=check)
+
+
+# ---------------------------------------------------------------- payback
 
 @dataclass(frozen=True)
 class PaybackOptions:
@@ -269,41 +392,41 @@ class PaybackOptions:
     horizon_years: int = 25
 
 
-def cashflow(result: Result, options: PaybackOptions) -> pd.DataFrame:
-    """Cumulative cash flow over the horizon.
-
-    Year t savings = first year savings * (1 + price growth)^(t-1) * (1 - degradation)^(t-1).
-    Scaling savings by degradation is an approximation: it assumes savings fall in proportion
-    to production. A battery replacement costs the same as the original battery.
-    """
+def _cashflow(net_investment: float, annual_savings: float, battery_investment: float,
+              options: PaybackOptions) -> pd.DataFrame:
     years = np.arange(1, options.horizon_years + 1)
     factor = ((1 + options.price_growth) * (1 - options.degradation)) ** (years - 1)
-    savings = result.annual_savings * factor
+    savings = annual_savings * factor
     replacement = np.zeros_like(savings)
-    if options.battery_life_years and result.inputs.battery_kwh > 0:
+    if options.battery_life_years and battery_investment > 0:
         due = (years % options.battery_life_years == 0) & (years < options.horizon_years)
-        replacement[due] = result.inputs.battery_investment
-    net = savings - replacement
+        replacement[due] = battery_investment
     return pd.DataFrame({
         "year": years,
         "savings": savings,
         "battery_replacement": replacement,
-        "cumulative": -result.inputs.investment + np.cumsum(net),
+        "cumulative": -net_investment + np.cumsum(savings - replacement),
     })
 
 
-def payback_years(result: Result, options: PaybackOptions) -> float | None:
-    """Year in which cumulative cash flow becomes non-negative for good (interpolated).
+def cashflow(result: Result, options: PaybackOptions) -> pd.DataFrame:
+    """Cumulative cash flow over the horizon, starting from the net investment.
 
-    None when the investment does not pay back within the horizon.
+    Year t savings = first year savings * (1 + price growth)^(t-1) * (1 - degradation)^(t-1).
+    Scaling savings by degradation is an approximation: it assumes savings fall in proportion
+    to production. A battery replacement costs the same as the original battery (no grant).
     """
-    flow = cashflow(result, options)
+    return _cashflow(result.net_investment, result.annual_savings, result.inputs.battery_investment, options)
+
+
+def _payback(net_investment: float, annual_savings: float, battery_investment: float,
+             options: PaybackOptions) -> float | None:
+    flow = _cashflow(net_investment, annual_savings, battery_investment, options)
     cumulative = flow["cumulative"].to_numpy()
     negative = np.nonzero(cumulative < 0)[0]
     if len(negative) == 0:
-        # Paid back within the first year.
         first_net = flow["savings"].iloc[0] - flow["battery_replacement"].iloc[0]
-        return result.inputs.investment / first_net if first_net > 0 else None
+        return net_investment / first_net if first_net > 0 else None
     last_negative = negative[-1]
     if last_negative == len(cumulative) - 1:
         return None
@@ -312,26 +435,48 @@ def payback_years(result: Result, options: PaybackOptions) -> float | None:
     return float(last_negative + 1 + (-before / step))
 
 
+def payback_years(result: Result, options: PaybackOptions) -> float | None:
+    """Year in which cumulative cash flow becomes non-negative for good (interpolated).
+
+    None when the investment does not pay back within the horizon.
+    """
+    return _payback(result.net_investment, result.annual_savings, result.inputs.battery_investment, options)
+
+
+# ---------------------------------------------------------------- oversizing sweep
+
 def sweep(base: Inputs, pv_values, battery_values, options: PaybackOptions) -> pd.DataFrame:
-    """Run the full analysis for every PV size x battery size combination."""
+    """Full analysis for every PV size x battery size, simulated together in one pass."""
+    grid = [(float(kwp), float(battery)) for battery in battery_values for kwp in pv_values]
+    kwp_arr = np.array([g[0] for g in grid])
+    bat_arr = np.array([g[1] for g in grid])
+    components = load_components(base)
+    flows = simulate_hourly(pv_per_kwp(base.nw_share), sum(components.values()), kwp_arr, bat_arr, base)
+    m = {name: monthly_average(values) for name, values in flows.items()}
+    money = net_billing(m["export"], m["import"], m["consumption"][:, 0], base)
+    summer = slice(3, 9)  # April - September
+    lost_per_kwh = base.grid_price - RCEM_2025[summer] * NET_BILLING_COEFFICIENT
+    production = m["production"].sum(axis=0)
+
     rows = []
-    for battery in battery_values:
-        for kwp in pv_values:
-            inp = replace(base, pv_kwp=float(kwp), battery_kwh=float(battery))
-            res = analyze(inp)
-            m = res.monthly
-            summer = m.index.isin(range(3, 9))  # April - September
-            rows.append({
-                "pv_kwp": kwp,
-                "battery_kwh": battery,
-                "investment": inp.investment,
-                "annual_savings": res.annual_savings,
-                "payback": payback_years(res, options),
-                "production": m["production"].sum(),
-                "self_consumption": m["self_consumption"].sum(),
-                "export": m["export"].sum(),
-                "export_share": m["export"].sum() / m["production"].sum(),
-                "summer_export_lost_value": m.loc[summer, "export_lost_value"].sum(),
-                "deposit_forfeited": res.deposit_forfeited,
-            })
+    for i, (kwp, battery) in enumerate(grid):
+        inp = replace(base, pv_kwp=kwp, battery_kwh=battery)
+        sup = support(inp)
+        net_investment = inp.investment - sup.grant - sup.tax_relief
+        savings = float(money["annual_savings"][i])
+        rows.append({
+            "pv_kwp": kwp,
+            "battery_kwh": battery,
+            "investment": inp.investment,
+            "net_investment": net_investment,
+            "grant": sup.grant,
+            "annual_savings": savings,
+            "payback": _payback(net_investment, savings, inp.battery_investment, options),
+            "production": production[i],
+            "self_consumption": (m["direct_use"][:, i] + m["from_battery"][:, i]).sum(),
+            "export": m["export"][:, i].sum(),
+            "export_share": m["export"][:, i].sum() / production[i],
+            "summer_export_lost_value": (m["export"][summer, i] * lost_per_kwh).sum(),
+            "deposit_forfeited": float(money["deposit_forfeited"][i]),
+        })
     return pd.DataFrame(rows)
