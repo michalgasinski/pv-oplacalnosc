@@ -21,7 +21,7 @@ import pandas as pd
 DATA = Path(__file__).parent / "data"
 LAT, LON = 53.12, 18.00  # village near Bydgoszcz
 TILT = 15
-ROOF_AZIMUTHS = {"pv_se": -60, "pv_nw": 120}  # PVGIS convention: 0 = south, -90 = east, 90 = west
+ROOF_AZIMUTHS = {"pv_east": -75, "pv_west": 105}  # PVGIS convention: 0 = south, -90 = east, 90 = west
 WEATHER_YEARS = (2019, 2023)
 ENEA_PROFILE_URL = "https://www.operator.enea.pl/media/3253/2025/zalacznik4iriesdprofile2026xlsx.xlsx"
 
@@ -42,7 +42,7 @@ def fetch_pvgis() -> pd.DataFrame:
         )
         hourly = pd.DataFrame(json.loads(get(url))["outputs"]["hourly"])
         frames[column] = hourly
-    base = frames["pv_se"]
+    base = frames["pv_east"]
     # PVGIS time "YYYYMMDD:HHMM" is UTC; values are averages for that hour.
     utc = pd.to_datetime(base["time"], format="%Y%m%d:%H%M", utc=True).dt.floor("h")
     local = utc.dt.tz_convert("Europe/Warsaw")
@@ -52,8 +52,8 @@ def fetch_pvgis() -> pd.DataFrame:
         "month": local.dt.month,
         "day_of_year": local.dt.day_of_year,
         "hour": local.dt.hour,
-        "pv_se": frames["pv_se"]["P"] / 1000,
-        "pv_nw": frames["pv_nw"]["P"] / 1000,
+        "pv_east": frames["pv_east"]["P"] / 1000,
+        "pv_west": frames["pv_west"]["P"] / 1000,
         "temp_c": base["T2m"],
     })
     # The last UTC hours of the final year fall into the next year in local time; drop them.

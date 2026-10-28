@@ -89,9 +89,9 @@ with st.sidebar:
     st.header("Parametry")
     st.subheader("Instalacja")
     pv_kwp = st.slider("Moc instalacji PV [kWp]", 4.0, 15.0, 8.0, 0.5)
-    nw_percent = st.slider(
-        "Część paneli na połaci północno-zachodniej [%]", 0, 100, 0, 10,
-        help="Reszta stoi na połaci południowo-wschodniej. Dach 15°.",
+    west_percent = st.slider(
+        "Część paneli na połaci zachodniej [%]", 0, 100, 0, 10,
+        help="Reszta stoi na połaci wschodniej. Dach 15°, połacie ok. 15° od osi wschód–zachód.",
     )
     battery_kwh = st.slider("Pojemność magazynu energii [kWh]", 0, 20, 10, 1)
 
@@ -153,7 +153,7 @@ with st.sidebar:
 
 inputs = Inputs(
     pv_kwp=pv_kwp,
-    nw_share=nw_percent / 100,
+    west_share=west_percent / 100,
     battery_kwh=float(battery_kwh),
     annual_consumption_kwh=float(annual),
     household_kwh=float(household),
@@ -431,7 +431,7 @@ with tab_assumptions:
                 "`data/` (skrypt `fetch_data.py`), więc każdą liczbę da się odtworzyć.")
 
     st.subheader("1. Lokalizacja i produkcja PV")
-    per_year = w.groupby("year")[["pv_se", "pv_nw"]].sum().round(0)
+    per_year = w.groupby("year")[["pv_east", "pv_west"]].sum().round(0)
     c1, c2 = st.columns([2, 3])
     with c1:
         st.markdown(f"""
@@ -439,23 +439,24 @@ with tab_assumptions:
 |---|---|
 | Lokalizacja | wieś pod Bydgoszczą, 53,12°N 18,00°E |
 | Dach | dwuspadowy, nachylenie 15° |
-| Połać główna | południowy wschód, azymut 60° na wschód od południa |
-| Połać druga | północny zachód, azymut 120° na zachód od południa |
-| Udział połaci NW | {nw_percent}% (suwak) |
+| Połać główna | wschód-południowy wschód, azymut 75° na wschód od południa |
+| Połać druga | zachód-północny zachód, azymut 105° na zachód od południa |
+| Orientacja | odczytana ze zdjęcia satelitarnego (oś budynku obrócona ok. 15°), dokładność ok. ±10° |
+| Udział połaci zachodniej | {west_percent}% (suwak) |
 | Dane pogodowe | PVGIS 5.3, baza SARAH3, lata 2019–2023, godzinowe |
 | Straty systemu | 14% (domyślne PVGIS: kable, falownik, zabrudzenie) |
-| Średni uzysk SE | {num(per_year['pv_se'].mean())} kWh/kWp/rok |
-| Średni uzysk NW | {num(per_year['pv_nw'].mean())} kWh/kWp/rok |
+| Średni uzysk – połać wschodnia | {num(per_year['pv_east'].mean())} kWh/kWp/rok |
+| Średni uzysk – połać zachodnia | {num(per_year['pv_west'].mean())} kWh/kWp/rok |
 """)
-        st.dataframe(per_year.rename(columns={"pv_se": "SE [kWh/kWp]", "pv_nw": "NW [kWh/kWp]"}),
+        st.dataframe(per_year.rename(columns={"pv_east": "Wschód [kWh/kWp]", "pv_west": "Zachód [kWh/kWp]"}),
                      width="stretch")
         st.caption("Różnice między latami to zmienność pogody – wyniki aplikacji to średnia z 5 lat.")
     with c2:
-        monthly_pv = w.groupby(["year", "month"])[["pv_se", "pv_nw"]].sum().groupby(level=1).mean()
+        monthly_pv = w.groupby(["year", "month"])[["pv_east", "pv_west"]].sum().groupby(level=1).mean()
         fig = go.Figure()
-        fig.add_bar(x=MONTH_NAMES, y=monthly_pv["pv_se"], name="Połać SE", marker_color=SERIES_COLORS[0],
+        fig.add_bar(x=MONTH_NAMES, y=monthly_pv["pv_east"], name="Połać wschodnia", marker_color=SERIES_COLORS[0],
                     hovertemplate="%{y:,.0f} kWh/kWp")
-        fig.add_bar(x=MONTH_NAMES, y=monthly_pv["pv_nw"], name="Połać NW", marker_color=SERIES_COLORS[1],
+        fig.add_bar(x=MONTH_NAMES, y=monthly_pv["pv_west"], name="Połać zachodnia", marker_color=SERIES_COLORS[1],
                     hovertemplate="%{y:,.0f} kWh/kWp")
         st.plotly_chart(style_figure(fig, "kWh na 1 kWp", height=380), width="stretch")
 
@@ -501,7 +502,7 @@ Gdy będą dane z licznika, wystarczy wpisać rzeczywiste zużycie roczne.
     month_no = MONTH_NAMES.index(month_pick) + 1
     hourly = pd.DataFrame({
         "month": w["month"], "hour": w["hour"],
-        "load": sum(comps.values()), "pv": pv_per_kwp(inputs.nw_share) * inputs.pv_kwp,
+        "load": sum(comps.values()), "pv": pv_per_kwp(inputs.west_share) * inputs.pv_kwp,
     })
     day = hourly[hourly["month"] == month_no].groupby("hour")[["load", "pv"]].mean()
     fig = go.Figure()

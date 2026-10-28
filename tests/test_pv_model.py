@@ -35,7 +35,7 @@ def test_weather_data_covers_five_years():
 def test_pv_yield_is_plausible_for_bydgoszcz():
     se = monthly_average(pv_per_kwp(0.0)[:, None]).sum()
     nw = monthly_average(pv_per_kwp(1.0)[:, None]).sum()
-    assert 850 < se < 950  # kWh per kWp per year on the south-east slope, 15°
+    assert 830 < se < 930  # kWh per kWp per year on the east slope (azimuth -75°), 15°
     assert nw < se
 
 

@@ -76,7 +76,7 @@ AFTERNOON_CHARGE_HOUR = 14
 @dataclass(frozen=True)
 class Inputs:
     pv_kwp: float = 8.0
-    nw_share: float = 0.0  # part of PV power on the north-west slope (rest on south-east)
+    west_share: float = 0.0  # part of PV power on the west slope (rest on the east slope)
     battery_kwh: float = 10.0
     annual_consumption_kwh: float = 7000.0
     household_kwh: float = 2600.0
@@ -236,9 +236,9 @@ def load_components(inp: Inputs) -> dict[str, np.ndarray]:
     }
 
 
-def pv_per_kwp(nw_share: float) -> np.ndarray:
+def pv_per_kwp(west_share: float) -> np.ndarray:
     w = weather()
-    return (1 - nw_share) * w["pv_se"].to_numpy() + nw_share * w["pv_nw"].to_numpy()
+    return (1 - west_share) * w["pv_east"].to_numpy() + west_share * w["pv_west"].to_numpy()
 
 
 # ---------------------------------------------------------------- energy simulation
@@ -457,7 +457,7 @@ def _monthly_frame(flows: dict[str, np.ndarray], components: dict[str, np.ndarra
 def analyze(inp: Inputs) -> Result:
     components = load_components(inp)
     load = sum(components.values())
-    flows = simulate_hourly(pv_per_kwp(inp.nw_share), load, np.array([inp.pv_kwp]),
+    flows = simulate_hourly(pv_per_kwp(inp.west_share), load, np.array([inp.pv_kwp]),
                             np.array([inp.battery_kwh]), inp)
     monthly = _monthly_frame(flows, components, 0)
     checks = {p: monthly_average(deposit_hourly(flows["export"], p))[:, 0] for p in ("hourly", "rcem")}
@@ -537,7 +537,7 @@ def sweep(base: Inputs, pv_values, battery_values, options: PaybackOptions) -> p
     kwp_arr = np.array([g[0] for g in grid])
     bat_arr = np.array([g[1] for g in grid])
     components = load_components(base)
-    flows = simulate_hourly(pv_per_kwp(base.nw_share), sum(components.values()), kwp_arr, bat_arr, base)
+    flows = simulate_hourly(pv_per_kwp(base.west_share), sum(components.values()), kwp_arr, bat_arr, base)
     m = {name: monthly_average(values) for name, values in flows.items()}
     deposit_in = monthly_average(deposit_hourly(flows["export"], base.export_pricing))
     money = net_billing(deposit_in, m["import"], m["consumption"][:, 0], base)

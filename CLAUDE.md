@@ -18,14 +18,15 @@ suwaki i wykresy bez pisania frontendu. Środowisko w `.venv/` (nie commitujemy)
 - `pv_model.py` – wszystkie obliczenia (bez UI): symulacja godzinowa, net-billing, dotacja, ulga, zwrot
 - `app.py` – interfejs Streamlit (panel boczny, zakładki: bilans, rachunek, przewymiarowanie, założenia)
 - `fetch_data.py` – jednorazowe pobranie danych do `data/` (commitujemy CSV, ~2,5 MB)
-- `data/pvgis_bydgoszcz.csv` – PVGIS 5.3, 2019–2023, produkcja na 1 kWp (połać SE i NW) + temperatura
+- `data/pvgis_bydgoszcz.csv` – PVGIS 5.3, 2019–2023, produkcja na 1 kWp (połać wschodnia i zachodnia) + temperatura
 - `data/enea_g11_profile_2026.csv` – standardowy profil G11 Enea Operator 2026 (udział w rocznym zużyciu)
 - `data/rce_2025_month_hour.csv` – średnie RCE 2025 per miesiąc × godzina (ujemne = 0) – wycena eksportu
 - `tests/test_pv_model.py` – testy modelu
 
 ## Ustalenia (z użytkownikiem)
-- Dom: wieś pod Bydgoszczą (53,12°N 18,00°E), dach dwuspadowy 15°, połacie SE (azymut −60°)
-  i NW (+120°); domyślnie panele na SE, suwak udziału NW.
+- Dom: wieś pod Bydgoszczą (53,12°N 18,00°E), dach dwuspadowy 15°. Orientacja ze zdjęcia satelitarnego
+  (oś budynku obrócona ~15°): połać wschodnia azymut −75° (ESE), zachodnia +105° (WNW), ±10°.
+  Domyślnie panele na wschodniej, suwak udziału zachodniej.
 - Zużycie (szacunek, brak danych z licznika): 7000 kWh razem, 2600 bytowe (2 dorosłych, jedno pracuje
   zdalnie), 500 ciepła woda z pompy (opcja), reszta ogrzewanie. Pompa: stopniodni poniżej 15°C ÷ COP,
   COP = 3,6 + 0,12·T (1,5–5).
