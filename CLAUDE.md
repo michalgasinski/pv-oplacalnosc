@@ -5,14 +5,15 @@ z pompą ciepła pod Bydgoszczą, nowy prosument w net-billingu, Enea G11.
 
 ## Stack
 Python 3.11 + Streamlit + Plotly. Wybrany, bo użytkownik chciał aplikację w Pythonie/Streamlit:
-suwaki i wykresy bez pisania frontendu. Środowisko w `.venv/` (nie commitujemy).
+suwaki i wykresy bez pisania frontendu. Środowisko w `.venv/` (nie commitujemy), zarządzane przez `uv`; zależności przypięte w `requirements.txt`.
 
 ## Komendy (PowerShell, w folderze aplikacji)
-- instalacja: `python -m venv .venv; .venv\Scripts\python.exe -m pip install -r requirements.txt`
-- uruchomienie: `.venv\Scripts\python.exe -m streamlit run app.py` (podgląd: wpis `pv-oplacalnosc`
-  w `.claude/launch.json`, port 8501)
-- testy: `.venv\Scripts\python.exe -m pytest`
-- odświeżenie danych źródłowych: `.venv\Scripts\python.exe fetch_data.py` (PVGIS, Enea, PSE)
+- instalacja: `uv venv --python 3.11; uv pip install -r requirements.txt`
+- uruchomienie: `uv run streamlit run app.py` (podgląd: wpis `pv-oplacalnosc` w `.claude/launch.json`,
+  port 8501; używa `.venv\Scripts\python.exe` bezpośrednio)
+- testy: `uv run pytest`
+- odświeżenie danych źródłowych: `uv run python fetch_data.py` (PVGIS, Enea, PSE)
+- dodanie/aktualizacja pakietu: zmień wersję w `requirements.txt` i powtórz `uv pip install -r requirements.txt`
 
 ## Struktura
 - `pv_model.py` – wszystkie obliczenia (bez UI): symulacja godzinowa, net-billing, dotacja, ulga, zwrot
